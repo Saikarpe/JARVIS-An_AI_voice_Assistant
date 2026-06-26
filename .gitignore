@@ -1,0 +1,32 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment variables (contains API keys - NEVER commit this)
+.env
+
+# SQLite temp files
+*.db-shm
+*.db-wal
+
+# Database file (generated at runtime)
+Data/jarvis.db
+
+# Auto-generated data files
+Data/*.txt
+
+# VS Code temp files
+**/tempCodeRunnerFile.py
+
+# Diagnostic/test scripts
+diagnose.py
+test_mic.py
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE settings
+.vscode/
+.idea/

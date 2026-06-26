@@ -15,6 +15,7 @@ from Backend.Automation import Automation
 from Backend.SpeechToText import SpeechRecognition
 from Backend.Chatbot import ChatBot
 from Backend.TextToSpeech import TextToSpeech, request_stop  # ⬅️ import stop helper
+from Backend.Database import log_usage, get_usage_summary
 from dotenv import dotenv_values
 from asyncio import run
 from time import sleep
@@ -22,6 +23,7 @@ import subprocess
 import threading
 import json
 import os
+import time
 
 # ────────────────────────────────────────────────────────────────────────────────
 #  Config / Globals
@@ -119,6 +121,12 @@ def MainExecution():
     # 1️⃣ Listen
     SetAssistantStatus("Listening…")
     Query = SpeechRecognition()
+
+    # Skip if no speech was detected
+    if not Query or not Query.strip():
+        SetAssistantStatus("Available…")
+        return True
+
     ShowTextToScreen(f" {Username}: {Query}")
 
     # 2️⃣ Think
@@ -179,9 +187,18 @@ def MainExecution():
         return True
 
     # 7️⃣ Answer logic
+    _t0 = time.time()
+
     if (G and R) or R:
         SetAssistantStatus("Searching…")
-        Answer = RealtimeSearchEngine(QueryModifier(Mearged_query))
+        try:
+            Answer = RealtimeSearchEngine(QueryModifier(Mearged_query))
+            _ms = int((time.time() - _t0) * 1000)
+            log_usage(Query, "realtime", _ms, "success")
+        except Exception as e:
+            _ms = int((time.time() - _t0) * 1000)
+            log_usage(Query, "realtime", _ms, "error", str(e))
+            Answer = "Sorry, I encountered an error while searching. Please try again."
         ShowTextToScreen(f" {Assistantname}: {Answer}")
         SetAssistantStatus("Answering…")
         TextToSpeech(Answer)
@@ -192,7 +209,14 @@ def MainExecution():
         if entry.startswith("general"):
             SetAssistantStatus("Thinking…")
             query_final = entry.replace("general", "").strip()
-            Answer = ChatBot(QueryModifier(query_final))
+            try:
+                Answer = ChatBot(QueryModifier(query_final))
+                _ms = int((time.time() - _t0) * 1000)
+                log_usage(Query, "general", _ms, "success")
+            except Exception as e:
+                _ms = int((time.time() - _t0) * 1000)
+                log_usage(Query, "general", _ms, "error", str(e))
+                Answer = "Sorry, I encountered an error. Please try again."
             ShowTextToScreen(f" {Assistantname}: {Answer}")
             SetAssistantStatus("Answering…")
             TextToSpeech(Answer)
@@ -201,7 +225,14 @@ def MainExecution():
         elif entry.startswith("realtime"):
             SetAssistantStatus("Searching…")
             query_final = entry.replace("realtime", "").strip()
-            Answer = RealtimeSearchEngine(QueryModifier(query_final))
+            try:
+                Answer = RealtimeSearchEngine(QueryModifier(query_final))
+                _ms = int((time.time() - _t0) * 1000)
+                log_usage(Query, "realtime", _ms, "success")
+            except Exception as e:
+                _ms = int((time.time() - _t0) * 1000)
+                log_usage(Query, "realtime", _ms, "error", str(e))
+                Answer = "Sorry, I encountered an error while searching. Please try again."
             ShowTextToScreen(f" {Assistantname}: {Answer}")
             SetAssistantStatus("Answering…")
             TextToSpeech(Answer)
