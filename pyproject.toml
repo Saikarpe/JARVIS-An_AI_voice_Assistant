@@ -1,0 +1,49 @@
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+# A curated core set, not ruff's own default — as of ruff 0.16 that default
+# turns on dozens of rule categories, including flake8-bandit (S) and
+# flake8-datetimez (DTZ). This codebase deliberately uses broad
+# `except Exception as e:` fail-soft handlers throughout (see e.g.
+# Backend/wake_word.py's and Backend/barge_in.py's module docstrings — a
+# missing mic or a bad model load should degrade the feature, not crash
+# the app) and naive local-time datetimes throughout (reminders,
+# usage_stats timestamps — there's no multi-timezone requirement here).
+# Selecting BLE/S/DTZ would flag every one of those as an error, which is
+# noise against this project's actual, documented style, not a real
+# finding.
+select = ["E", "F", "I"]
+ignore = [
+    "E501",  # line length — a handful of existing SQL/comment lines run long; not worth reformatting
+]
+
+[tool.ruff.lint.per-file-ignores]
+# main.py's import order is load-bearing, not accidental — see the
+# comments at each import block explaining the Windows DLL-load-order
+# workaround (onnxruntime before PyQt5) and "configure logging before
+# anything else logs" requirement.
+"main.py" = ["E402"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+# Backend/ and Frontend/ have no __init__.py (implicit namespace packages —
+# every `from Backend.X import Y` in this codebase relies on that), which
+# otherwise makes mypy see e.g. Backend/tools/files.py as reachable under
+# two different module names. explicit_package_bases (mypy's own
+# recommended fix for this exact layout) resolves it without adding
+# __init__.py files this project doesn't otherwise want.
+explicit_package_bases = true
+mypy_path = "."
+# Opt-in, not strict: this codebase's type hints predate mypy being added
+# (Phase 6) and the tool registry (Backend/tools/registry.py) specifically
+# depends on hints being *present and accurate* on every @tool function's
+# signature — see its own docstring — so that's where hint quality matters
+# most. Turning on strict mode project-wide would surface hundreds of
+# pre-existing gaps unrelated to that, all at once, in a phase whose scope
+# is "add the check", not "fully retrofit hints everywhere".
+check_untyped_defs = true
+warn_redundant_casts = true
+warn_unused_ignores = true

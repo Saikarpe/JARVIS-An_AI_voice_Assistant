@@ -13,8 +13,14 @@ __pycache__/
 # Database file (generated at runtime)
 Data/jarvis.db
 
+# Conversation content (generated at runtime, not source)
+Data/ChatLog.json
+
 # Auto-generated data files
 Data/*.txt
+
+# Rotating app logs (Phase 6, see Backend/logging_config.py)
+Data/logs/
 
 # VS Code temp files
 **/tempCodeRunnerFile.py

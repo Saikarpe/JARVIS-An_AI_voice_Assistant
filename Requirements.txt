@@ -1,17 +1,47 @@
-python-dotenv
-groq
-AppOpener
-pywhatkit
-bs4
-pillow
-rich
-requests
-keyboard
-cohere
-googlesearch-python
-selenium
-mtranslate
-pygame
-edge-tts
-PyQt5
-webdriver-manager
+# Core
+python-dotenv==1.0.0
+PyQt5==5.15.11
+
+# LLM / agent provider (Groq, native tool calling — see Backend/agent.py
+# and Backend/tools/). Cohere was removed in Phase 2: Backend/Model.py's
+# intent-classification prompt is gone, replaced by tool-calling on the
+# same Groq model that answers.
+groq==1.5.0
+
+# Web search / automation
+ddgs==9.15.0                # duckduckgo-search was renamed upstream; see Backend/tools/web.py
+AppOpener==1.7
+bs4==0.0.2
+requests==2.34.2
+keyboard==0.13.5
+
+# Speech (Phase 3 — wake word, Groq Whisper STT, barge-in)
+SpeechRecognition==3.17.0   # kept only for the Google STT fallback backend
+                             # (Backend.config.STT_BACKEND) — see Backend/SpeechToText.py
+PyAudio==0.2.14
+mtranslate==1.8
+edge-tts==7.2.8
+pygame==2.6.1
+numpy==1.26.2
+sounddevice==0.5.6          # mic capture for STT/wake-word/barge-in
+webrtcvad-wheels==2.0.14    # prebuilt Windows wheels; plain webrtcvad needs a C compiler
+openwakeword==0.6.0
+onnxruntime==1.29.0         # openwakeword's inference backend
+
+# Memory / reminders (Phase 4)
+fastembed==0.8.0            # local ONNX embeddings for long-term memory recall — see Backend/Database.py
+dateparser==1.4.2           # natural-language reminder times — see Backend/tools/reminders.py
+
+# Image / misc
+pillow==11.3.0
+rich==15.0.0
+
+# UI (Phase 5.5) — file upload's .pdf text extraction, see Backend/file_context.py
+pypdf==6.16.2
+
+# Dev / CI only (Phase 6) — tests, lint, type check. Not needed to run the
+# app itself; see README.md's "Development" section.
+pytest==9.1.1
+ruff==0.16.5
+mypy==2.3.1
+PyQt5-stubs==5.15.6.0        # mypy has no type info for PyQt5's Qt-namespace enums without this

@@ -3,13 +3,24 @@ Database module for Jarvis AI Assistant.
 Uses SQLite to persist conversations, search history, and usage statistics.
 """
 
-import sqlite3
 import datetime
 import json
+import logging
 import os
+import sqlite3
 import threading
 
-DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "Data", "jarvis.db")
+logger = logging.getLogger(__name__)
+
+# JARVIS_DB_PATH override (Phase 6): lets tests/conftest.py point every
+# module-level connection at a throwaway file instead of the real
+# Data/jarvis.db — set before this module is first imported anywhere in
+# the process, since DB_PATH is read once here and initialize_database()
+# runs at import time (see bottom of this file). Unset in normal use; the
+# default is unchanged.
+DB_PATH = os.environ.get("JARVIS_DB_PATH") or os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "Data", "jarvis.db"
+)
 
 # Thread-local storage for connections (SQLite connections are not thread-safe)
 _local = threading.local()
@@ -84,8 +95,24 @@ def initialize_database():
         )
     """)
 
+    # ── Long-term memory table (Phase 4.1, see ENHANCEMENT_PLAN.md) ──
+    # embedding is a float32 numpy array's raw .tobytes() — fixed-width
+    # (384 dims * 4 bytes for BAAI/bge-small-en-v1.5), so no length column
+    # is needed to unpack it back with np.frombuffer(..., dtype='float32').
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS memories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            content TEXT NOT NULL,
+            kind TEXT NOT NULL DEFAULT 'fact',
+            embedding BLOB NOT NULL,
+            importance REAL DEFAULT 0.5,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            last_used DATETIME
+        )
+    """)
+
     conn.commit()
-    print("[Database] Initialized successfully at:", DB_PATH)
+    logger.info("Initialized successfully at: %s", DB_PATH)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -97,6 +124,56 @@ _current_session_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
 def get_session_id():
     return _current_session_id
+
+
+def set_session_id(session_id: str):
+    """Switch the *active* session — Phase 5.5's conversation history
+    sidebar calls this when the user picks a past session to resume, so
+    the next save_message()/get_chat_history() (no explicit session_id
+    passed) targets that session instead of always the one created at
+    process start."""
+    global _current_session_id
+    _current_session_id = session_id
+
+
+def get_sessions(limit=50):
+    """One row per session: id, first message's preview text, message
+    count, and when it was last active — most recent first. Backs the
+    Phase 5.5 history sidebar; get_all_chat_history() already existed but
+    returns one flat list across every session with no way to group it."""
+    conn = _get_connection()
+    rows = conn.execute(
+        """
+        SELECT session_id,
+               COUNT(*) AS message_count,
+               MIN(timestamp) AS started_at,
+               MAX(timestamp) AS last_active
+        FROM conversations
+        GROUP BY session_id
+        ORDER BY last_active DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+
+    sessions = []
+    for row in rows:
+        first = conn.execute(
+            "SELECT content FROM conversations WHERE session_id = ? AND role = 'user' "
+            "ORDER BY id ASC LIMIT 1",
+            (row["session_id"],),
+        ).fetchone()
+        preview = (first["content"] if first else "").strip()
+        if len(preview) > 60:
+            preview = preview[:60] + "..."
+        sessions.append({
+            "session_id": row["session_id"],
+            "preview": preview or "(empty)",
+            "message_count": row["message_count"],
+            "started_at": row["started_at"],
+            "last_active": row["last_active"],
+        })
+    return sessions
 
 
 def save_message(role, content, session_id=None):
@@ -229,6 +306,132 @@ def get_preference(key, default=None):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Reminders (Phase 4.2, see ENHANCEMENT_PLAN.md) — the table has existed
+#  since the original schema; nothing ever read or wrote it until now.
+#  Backend/tools/reminders.py is the write side (the create_reminder tool),
+#  Backend/scheduler_worker.py's SchedulerWorker is the read side (polls
+#  get_due_reminders() every ~30s and speaks anything that's due).
+# ─────────────────────────────────────────────────────────────────────────────
+
+def create_reminder_row(message, remind_at_iso):
+    """remind_at_iso must already be a valid ISO-8601 string — parsing/
+    natural-language handling (dateparser) lives in the tool layer, not
+    here, so this module stays a thin, dumb persistence layer."""
+    conn = _get_connection()
+    conn.execute(
+        "INSERT INTO reminders (message, remind_at) VALUES (?, ?)",
+        (message, remind_at_iso),
+    )
+    conn.commit()
+
+
+def get_due_reminders(now_iso=None):
+    """Reminders that are due and haven't fired yet, oldest due-time first."""
+    conn = _get_connection()
+    now_iso = now_iso or datetime.datetime.now().isoformat(timespec="seconds")
+    cursor = conn.execute(
+        "SELECT id, message, remind_at FROM reminders "
+        "WHERE is_completed = 0 AND remind_at <= ? ORDER BY remind_at",
+        (now_iso,),
+    )
+    return [dict(row) for row in cursor.fetchall()]
+
+
+def mark_reminder_done(reminder_id):
+    conn = _get_connection()
+    conn.execute("UPDATE reminders SET is_completed = 1 WHERE id = ?", (reminder_id,))
+    conn.commit()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Long-term memory (Phase 4.1, see ENHANCEMENT_PLAN.md)
+# ─────────────────────────────────────────────────────────────────────────────
+#  fastembed is imported lazily, inside _get_embedder(), not at module load:
+#  Database.py is imported very early by almost everything (agent.py,
+#  agent_worker.py, config.py, every tool), and fastembed's first call
+#  downloads a ~130MB ONNX model — that shouldn't become a startup cost (or
+#  a hard crash on a machine with no internet) for code paths that never
+#  touch memory at all. remember()/recall() below fail loudly if the import
+#  or download fails; Backend/tools/memory.py's tool wrappers are what
+#  catch that and turn it into a normal "Error: ..." tool result instead of
+#  crashing the agent loop.
+
+_embedder = None
+_EMBED_MODEL = "BAAI/bge-small-en-v1.5"  # 384-dim, ONNX, CPU-only, ~130MB
+
+
+def _get_embedder():
+    global _embedder
+    if _embedder is None:
+        from fastembed import TextEmbedding
+        _embedder = TextEmbedding(_EMBED_MODEL)
+    return _embedder
+
+
+def remember(content, kind="fact", importance=0.5):
+    """Save a durable fact/preference/event, embedded for later semantic
+    recall(). Not deduplicated — deciding whether a new fact supersedes an
+    old one is a judgment call left to the model (via the recall_memory
+    tool showing it what's already stored), not something this layer
+    tries to guess with a similarity threshold."""
+
+    vec = next(_get_embedder().embed([content])).astype("float32")
+    conn = _get_connection()
+    conn.execute(
+        "INSERT INTO memories (content, kind, embedding, importance) VALUES (?, ?, ?, ?)",
+        (content, kind, vec.tobytes(), importance),
+    )
+    conn.commit()
+
+
+def recall(query, k=5, min_score=0.35):
+    """Brute-force cosine similarity over every stored memory. The plan's
+    own sizing note applies: this is well under a millisecond for a few
+    thousand rows, so there's no vector DB here — add sqlite-vec only if
+    this table ever exceeds ~50k rows."""
+    import numpy as np
+
+    conn = _get_connection()
+    rows = conn.execute("SELECT id, content, embedding FROM memories").fetchall()
+    if not rows:
+        return []
+
+    qv = next(_get_embedder().embed([query])).astype("float32")
+    qnorm = np.linalg.norm(qv)
+    if qnorm == 0:
+        return []
+
+    scored = []
+    for row in rows:
+        v = np.frombuffer(row["embedding"], dtype="float32")
+        vnorm = np.linalg.norm(v)
+        if vnorm == 0:
+            continue
+        score = float(qv @ v / (qnorm * vnorm))
+        scored.append((score, row["id"], row["content"]))
+    scored.sort(key=lambda s: s[0], reverse=True)
+    top = [s for s in scored[:k] if s[0] > min_score]
+
+    if top:
+        ids = tuple(rid for _, rid, _ in top)
+        placeholders = ",".join("?" * len(ids))
+        conn.execute(
+            f"UPDATE memories SET last_used = CURRENT_TIMESTAMP WHERE id IN ({placeholders})",
+            ids,
+        )
+        conn.commit()
+
+    return [content for _, _, content in top]
+
+
+def clear_memories():
+    """Backs the Phase 5.5 settings panel's "clear memory" button."""
+    conn = _get_connection()
+    conn.execute("DELETE FROM memories")
+    conn.commit()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Migrate existing ChatLog.json into the database
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -257,9 +460,9 @@ def migrate_from_json():
                 ("migrated", entry.get("role", "user"), entry.get("content", ""))
             )
         conn.commit()
-        print(f"[Database] Migrated {len(data)} messages from ChatLog.json")
+        logger.info("Migrated %d messages from ChatLog.json", len(data))
     except Exception as e:
-        print(f"[Database] Migration skipped: {e}")
+        logger.warning("Migration skipped: %s", e)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

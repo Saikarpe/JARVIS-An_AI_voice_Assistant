@@ -1,275 +1,122 @@
-from Frontend.GUI import (
-    GraphicalUserInterface,
-    SetAssistantStatus,
-    ShowTextToScreen,
-    TempDirectoryPath,
-    SetMicrophoneStatus,
-    AnswerModifier,
-    QueryModifier,
-    GetMicrophoneStatus,
-    GetAssistantStatus,
-)
-from Backend.Model import FirstLayerDMM
-from Backend.RealtimeSearchEngine import RealtimeSearchEngine
-from Backend.Automation import Automation
-from Backend.SpeechToText import SpeechRecognition
-from Backend.Chatbot import ChatBot
-from Backend.TextToSpeech import TextToSpeech, request_stop  # ⬅️ import stop helper
-from Backend.Database import log_usage, get_usage_summary
-from dotenv import dotenv_values
-from asyncio import run
-from time import sleep
-import subprocess
-import threading
-import json
+"""
+Entry point for Jarvis.
+
+Phase 1 (see ENHANCEMENT_PLAN.md) replaced the old design here: a daemon
+thread ran a listen/decide/act loop that communicated with the GUI purely by
+writing files under Frontend/Files/, which the GUI polled with QTimers.
+That's gone. Now:
+
+  - Backend.agent_worker.AgentWorker holds the entire pipeline and runs on
+    its own QThread, emitting Qt signals for every state change.
+  - Backend.scheduler_worker.SchedulerWorker (Phase 4.2/4.3) runs on a
+    second QThread, polling for due reminders and — if enabled — firing a
+    daily proactive briefing.
+  - Frontend.GUI.MainWindow.attach_worker()/attach_scheduler() wire those
+    signals straight to the widgets that display them, and wire the GUI's
+    own signals (typed queries, mic toggle, file upload) back to
+    AgentWorker's slots.
+  - This module's only job is to construct all of that and connect it.
+"""
+
 import os
-import time
+import sys
 
-# ────────────────────────────────────────────────────────────────────────────────
-#  Config / Globals
-# ────────────────────────────────────────────────────────────────────────────────
-env_vars = dotenv_values(".env")
-Username = env_vars.get("Username")
-Assistantname = env_vars.get("Assistantname")
+# The Windows console's default codepage (cp1252 or the OEM codepage) can't
+# encode plenty of characters this app prints in normal operation — search
+# result text, an em dash in a log message, non-English translated speech.
+# Found via a print() crashing mid-test with UnicodeEncodeError on
+# character U+2192 in a debug line. Force UTF-8 on stdout/stderr with
+# replacement instead of a hard crash for anything that still won't encode.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
-DefaultMessage = f"""{Username}: Hello {Assistantname}, How are you?
-{Assistantname}: Welcome {Username}. I am doing well. How may I help you?"""
+# Phase 6: configure logging before anything else logs. Backend.Database
+# runs initialize_database() (which logs) at import time, and that import
+# happens transitively the moment Frontend.GUI -> Backend.agent_worker ->
+# Backend.agent resolves below — so this has to come before those imports,
+# not just before main() runs. See Backend/logging_config.py's docstring.
+from Backend.logging_config import setup_logging
 
-subprocesses = []
-Functions = [
-    "open",
-    "close",
-    "play",
-    "system",
-    "content",
-    "google search",
-    "youtube search",
-    "write",
-    "give",
-    "read",
-    "mute",
-    "unmute",
-    "volume up",
-    "volume down",
-]
+setup_logging()
 
-# ────────────────────────────────────────────────────────────────────────────────
-#  Helper routines
-# ────────────────────────────────────────────────────────────────────────────────
+# Import onnxruntime (openwakeword's inference backend, see
+# Backend/wake_word.py) before PyQt5 touches anything. Found by testing
+# Phase 4: on Windows, whichever of PyQt5 or onnxruntime's native
+# extension loads its DLLs into the process first "wins", and PyQt5
+# imported first leaves onnxruntime's pybind11 extension unable to
+# initialize ("DLL load failed") — reproduced with nothing more than
+# `from PyQt5.QtWidgets import QApplication` before the onnxruntime
+# import, no QApplication instance even required. WakeWordDetector
+# already fails soft or this would be a hard crash instead of a silently
+# disabled Phase 3 headline feature — but silently disabled is still a
+# real regression, so it's fixed at the one place that's guaranteed to
+# run before any PyQt5 import: the top of this file. Optional import
+# (try/except) since onnxruntime is only needed for wake word, which
+# already tolerates not being installed at all.
+try:
+    import onnxruntime  # noqa: F401
+except ImportError:
+    pass
 
-def ShowDefaultChatIfNoChats():
-    with open(r"Data/ChatLog.json", "r", encoding="utf-8") as file:
-        if len(file.read()) < 5:
-            with open(TempDirectoryPath("Database.data"), "w", encoding="utf-8") as f:
-                f.write("")
-            with open(TempDirectoryPath("Responses.data"), "w", encoding="utf-8") as f:
-                f.write(DefaultMessage)
+import logging
 
+from PyQt5.QtCore import QThread
+from PyQt5.QtWidgets import QApplication
 
-def ReadChatLogJson():
-    with open(r"Data/ChatLog.json", "r", encoding="utf-8") as file:
-        return json.load(file)
+from Backend.agent_worker import AgentWorker
+from Backend.scheduler_worker import SchedulerWorker
+from Frontend.GUI import MainWindow
 
-
-def ChatLogIntegration():
-    json_data = ReadChatLogJson()
-    formatted_chatlog = ""
-    for entry in json_data:
-        if entry["role"] == "user":
-            formatted_chatlog += f"User: {entry['content']}\n"
-        elif entry["role"] == "assistant":
-            formatted_chatlog += f"Assistant: {entry['content']}\n"
-
-    formatted_chatlog = (
-        formatted_chatlog.replace("User", Username + " ")
-        .replace("Assistant", Assistantname + " ")
-        .strip()
-    )
-
-    with open(TempDirectoryPath("Database.data"), "w", encoding="utf-8") as file:
-        file.write(AnswerModifier(formatted_chatlog))
+logger = logging.getLogger(__name__)
 
 
-def ShowChatsOnGUI():
-    with open(TempDirectoryPath("Database.data"), "r", encoding="utf-8") as file:
-        data = file.read()
-    if data:
-        lines = data.split("\n")
-        result = "\n".join(lines)
-        # GUI already watches file, nothing else to do
+def main():
+    app = QApplication(sys.argv)
 
+    window = MainWindow()
 
-def InitialExecution():
-    SetMicrophoneStatus("True")  # mic ON from the very start
-    ShowTextToScreen("")
-    ShowDefaultChatIfNoChats()
-    ChatLogIntegration()
-    ShowChatsOnGUI()
+    thread = QThread()
+    worker = AgentWorker()
+    worker.moveToThread(thread)
+    thread.started.connect(worker.run)
 
+    window.attach_worker(worker)
 
-InitialExecution()
+    # Phase 4.2/4.3: a second QThread for reminders/proactive behaviors,
+    # deliberately separate from AgentWorker's thread — SchedulerWorker's
+    # 30s poll loop must keep running (and reminders must still fire) even
+    # while AgentWorker is blocked inside a real, uninterruptible mic read.
+    scheduler_thread = QThread()
+    scheduler = SchedulerWorker()
+    scheduler.moveToThread(scheduler_thread)
+    scheduler_thread.started.connect(scheduler.run)
 
-# ────────────────────────────────────────────────────────────────────────────────
-#  Main Execution Loop
-# ────────────────────────────────────────────────────────────────────────────────
+    window.attach_scheduler(scheduler)
 
-def MainExecution():
-    TaskExecution = False
-    ImageExecution = False
-    ImageGenerationQuery = ""
-
-    # 1️⃣ Listen
-    SetAssistantStatus("Listening…")
-    Query = SpeechRecognition()
-
-    # Skip if no speech was detected
-    if not Query or not Query.strip():
-        SetAssistantStatus("Available…")
-        return True
-
-    ShowTextToScreen(f" {Username}: {Query}")
-
-    # 2️⃣ Think
-    SetAssistantStatus("Thinking…")
-    Decision = FirstLayerDMM(Query)
-    print("\nDecision:", Decision, "\n")
-
-    # 3️⃣ 👉 Handle STOP early
-    if "stop" in [d.lower() for d in Decision]:
-        request_stop()
-        SetAssistantStatus("Stopped.")
-        ShowTextToScreen(f" {Assistantname}: Okay, stopping.")
-        # keep mic active so user can speak again immediately
-        SetMicrophoneStatus("True")
-        return True
-
-    # 4️⃣ Extract info flags
-    G = any(item.startswith("general") for item in Decision)
-    R = any(item.startswith("realtime") for item in Decision)
-    Mearged_query = " and ".join(
-        [" ".join(i.split()[1:]) for i in Decision if i.startswith(("general", "realtime"))]
-    )
-
-    # 5️⃣ Automation / System commands
-    for entry in Decision:
-        if not TaskExecution:
-            # patch: map "write" to "content"
-            for i, q in enumerate(Decision):
-                if q.lower().startswith("write "):
-                    Decision[i] = "content " + q.split(" ", 1)[1]
-            if any(entry.startswith(func) for func in Functions):
-                run(Automation(list(Decision)))
-                TaskExecution = True
-
-    # 6️⃣ Image generation trigger
-    for entry in Decision:
-        if entry.lower().startswith(("generate image", "image", "draw")):
-            ImageGenerationQuery = entry.split(" ", 2)[-1]
-            ImageExecution = True
-            break
-    if ImageExecution:
-        SetAssistantStatus("Generating image…")
-        with open(r"Frontend/Files/ImageGeneration.data", "w", encoding="utf-8") as f:
-            f.write(f"{ImageGenerationQuery},True")
-        try:
-            p = subprocess.Popen(
-                ["python", r"Backend/ImageGeneration.py"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                stdin=subprocess.PIPE,
-                shell=False,
-            )
-            subprocesses.append(p)
-        except Exception as e:
-            print("Error starting ImageGeneration.py:", e)
-        # mic stays ON, assistant keeps listening while image renders
-        SetMicrophoneStatus("True")
-        return True
-
-    # 7️⃣ Answer logic
-    _t0 = time.time()
-
-    if (G and R) or R:
-        SetAssistantStatus("Searching…")
-        try:
-            Answer = RealtimeSearchEngine(QueryModifier(Mearged_query))
-            _ms = int((time.time() - _t0) * 1000)
-            log_usage(Query, "realtime", _ms, "success")
-        except Exception as e:
-            _ms = int((time.time() - _t0) * 1000)
-            log_usage(Query, "realtime", _ms, "error", str(e))
-            Answer = "Sorry, I encountered an error while searching. Please try again."
-        ShowTextToScreen(f" {Assistantname}: {Answer}")
-        SetAssistantStatus("Answering…")
-        TextToSpeech(Answer)
-        SetMicrophoneStatus("True")  # immediately reopen mic
-        return True
-
-    for entry in Decision:
-        if entry.startswith("general"):
-            SetAssistantStatus("Thinking…")
-            query_final = entry.replace("general", "").strip()
-            try:
-                Answer = ChatBot(QueryModifier(query_final))
-                _ms = int((time.time() - _t0) * 1000)
-                log_usage(Query, "general", _ms, "success")
-            except Exception as e:
-                _ms = int((time.time() - _t0) * 1000)
-                log_usage(Query, "general", _ms, "error", str(e))
-                Answer = "Sorry, I encountered an error. Please try again."
-            ShowTextToScreen(f" {Assistantname}: {Answer}")
-            SetAssistantStatus("Answering…")
-            TextToSpeech(Answer)
-            SetMicrophoneStatus("True")
-            return True
-        elif entry.startswith("realtime"):
-            SetAssistantStatus("Searching…")
-            query_final = entry.replace("realtime", "").strip()
-            try:
-                Answer = RealtimeSearchEngine(QueryModifier(query_final))
-                _ms = int((time.time() - _t0) * 1000)
-                log_usage(Query, "realtime", _ms, "success")
-            except Exception as e:
-                _ms = int((time.time() - _t0) * 1000)
-                log_usage(Query, "realtime", _ms, "error", str(e))
-                Answer = "Sorry, I encountered an error while searching. Please try again."
-            ShowTextToScreen(f" {Assistantname}: {Answer}")
-            SetAssistantStatus("Answering…")
-            TextToSpeech(Answer)
-            SetMicrophoneStatus("True")
-            return True
-        elif entry == "exit":
-            request_stop()
-            Answer = "Okay, Bye!"
-            ShowTextToScreen(f" {Assistantname}: {Answer}")
-            SetAssistantStatus("Answering…")
-            TextToSpeech(Answer)
-            sleep(0.5)
+    def _shutdown():
+        worker.shutdown()
+        scheduler.shutdown()
+        thread.quit()
+        scheduler_thread.quit()
+        finished_cleanly = thread.wait(3000) and scheduler_thread.wait(3000)
+        if not finished_cleanly:
+            # The worker thread is very likely blocked inside a real,
+            # uninterruptible microphone read (PortAudio/PyAudio has no
+            # cooperative cancellation). Unlike the old daemon-thread
+            # design, a QThread isn't auto-killed on process exit, so
+            # without this the app could hang on close instead of exiting.
+            # Force-terminate rather than risk that.
+            logger.warning("a worker thread did not stop in time; forcing exit")
             os._exit(0)
 
+    app.aboutToQuit.connect(_shutdown)
 
-# ────────────────────────────────────────────────────────────────────────────────
-#  Thread wrappers
-# ────────────────────────────────────────────────────────────────────────────────
-
-def FirstThread():
-    while True:
-        if GetMicrophoneStatus() == "True":
-            MainExecution()
-        else:
-            if "Available…" not in GetAssistantStatus():
-                SetAssistantStatus("Available…")
-            sleep(0.05)
+    thread.start()
+    scheduler_thread.start()
+    window.show()
+    sys.exit(app.exec_())
 
 
-def SecondThread():
-    GraphicalUserInterface()
-
-
-# ────────────────────────────────────────────────────────────────────────────────
-#  Entry‑point
-# ────────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    thread1 = threading.Thread(target=FirstThread, daemon=True)
-    thread1.start()
-    SecondThread()
+    main()

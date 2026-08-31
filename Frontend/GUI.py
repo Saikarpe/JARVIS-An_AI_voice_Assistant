@@ -1,26 +1,60 @@
-from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QTextEdit, QStackedWidget, QWidget, QLineEdit,
-    QVBoxLayout, QHBoxLayout, QPushButton, QFrame, QLabel, QSizePolicy,
-    QFileDialog, QMenu, QStatusBar
-)
-from PyQt5.QtGui import (
-    QIcon, QPainter, QMovie, QColor, QTextCharFormat, QFont, QPixmap,
-    QLinearGradient, QRadialGradient, QPen, QBrush, QConicalGradient
-)
-from PyQt5.QtCore import Qt, QSize, QTimer, QRect, QPointF
-from dotenv import dotenv_values
-import sys
-import os
-import uuid
+import logging
 import math
+import os
 import random
+import sys
+import time
+
+from dotenv import dotenv_values
+from PyQt5.QtCore import QPointF, QSettings, Qt, QTimer, pyqtSignal, pyqtSlot
+from PyQt5.QtGui import QBrush, QColor, QIcon, QKeySequence, QLinearGradient, QPainter, QPen, QPixmap, QRadialGradient
+from PyQt5.QtWidgets import (
+    QAction,
+    QApplication,
+    QDialog,
+    QFileDialog,
+    QFrame,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMenu,
+    QMessageBox,
+    QPushButton,
+    QScrollArea,
+    QShortcut,
+    QStackedWidget,
+    QStatusBar,
+    QSystemTrayIcon,
+    QVBoxLayout,
+    QWidget,
+)
+
+from Frontend import theme
+from Frontend.widgets.history_sidebar import HistorySidebar
+from Frontend.widgets.message_bubble import MessageBubble
+from Frontend.widgets.settings_dialog import SettingsDialog
+from Frontend.widgets.stats_panel import StatsDialog
+from Frontend.widgets.toast import ToastManager
+
+logger = logging.getLogger(__name__)
 
 env_vars = dotenv_values(".env")
-Assistantname = env_vars.get("Assistantname", "Grok")
+Assistantname = env_vars.get("Assistantname") or "Grok"
 current_dir = os.getcwd()
-old_chat_message = ""
-TempDirPath = rf"{current_dir}\Frontend\Files"
 GraphicsDirPath = rf"{current_dir}\Frontend\Graphics"
+
+# ────────────────────────────────────────────────────────────────────────────
+# NOTE on architecture (Phase 1, see ENHANCEMENT_PLAN.md)
+# ────────────────────────────────────────────────────────────────────────────
+# This module used to talk to main.py by reading/writing flat files under
+# Frontend/Files/ (Status.data, Responses.data, Mic.data, Query.data, ...),
+# polled by three separate QTimers. That's gone. The GUI now only knows
+# about state through Qt signals emitted by Backend.agent_worker.AgentWorker,
+# wired up in MainWindow.attach_worker(). No file in Frontend/Files/ is read
+# or written by this module any more.
 
 def AnswerModifier(Answer):
     lines = Answer.split('\n')
@@ -43,232 +77,288 @@ def QueryModifier(Query):
             new_query += "."
     return new_query.capitalize()
 
-def SetMicrophoneStatus(Command):
-    with open(rf'{TempDirPath}\Mic.data', "w", encoding='utf-8') as file:
-        file.write(Command)
-
-def GetMicrophoneStatus():
-    with open(rf'{TempDirPath}\Mic.data', "r", encoding='utf-8') as file:
-        return file.read()
-
-def SetAssistantStatus(Status):
-    with open(rf'{TempDirPath}\Status.data', "w", encoding='utf-8') as file:
-        file.write(Status)
-
-def GetAssistantStatus():
-    with open(rf'{TempDirPath}\Status.data', "r", encoding='utf-8') as file:
-        return file.read()
-
-def MicButtonInitialed():
-    SetMicrophoneStatus("False")
-
-def MicButtonClosed():
-    SetMicrophoneStatus("True")
-
 def GraphicsDirectoryPath(Filename):
     return rf'{GraphicsDirPath}\{Filename}'
 
-def TempDirectoryPath(Filename):
-    return rf'{TempDirPath}\{Filename}'
 
-def ShowTextToScreen(Text):
-    with open(rf'{TempDirPath}\Responses.data', "w", encoding='utf-8') as file:
-        file.write(Text)
+def _system_prefers_reduced_motion() -> bool:
+    """Best-effort read of Windows' "Show animations" accessibility
+    setting (Settings > Accessibility > Visual effects > Animation
+    effects). Qt has no cross-platform prefers-reduced-motion query — this
+    is deliberately Windows-only, matching this project's stated target
+    platform (ENHANCEMENT_PLAN.md rule 6). Fails soft (assumes motion is
+    fine) on any other OS or if the call fails, same pattern as
+    WakeWordDetector/BargeInMonitor elsewhere in this codebase."""
+    if sys.platform != "win32":
+        return False
+    try:
+        import ctypes
+        SPI_GETCLIENTAREAANIMATION = 0x1042
+        value = ctypes.c_bool()
+        ok = ctypes.windll.user32.SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION, 0, ctypes.byref(value), 0
+        )
+        return bool(ok) and not value.value
+    except Exception:
+        return False
 
 class ChatSection(QWidget):
+    """The chat panel (Phase 5.2/5.3, see ENHANCEMENT_PLAN.md).
+
+    Used to be one QTextEdit that every turn got HTML-inserted into (see
+    git history for the old addMessage()). Now a QScrollArea of
+    MessageBubble widgets — one per turn — each independently
+    Markdown-rendered, self-sizing, and (for assistant turns) carrying its
+    own live ToolTimeline. Streaming and tool-call events target "the
+    assistant bubble currently in progress for this turn", tracked by
+    _current_bubble and reset to None whenever a new user turn starts or
+    the current one's final answer arrives.
+    """
+
+    # GUI -> worker
+    query_submitted = pyqtSignal(str)
+    file_uploaded = pyqtSignal(str)
+
     def __init__(self):
         super().__init__()
+        self._current_bubble = None
+        self._message_count = 0
+
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 50, 20, 120)
+        layout.setContentsMargins(20, 50, 20, 20)
         layout.setSpacing(10)
 
-        self.chat_text_edit = QTextEdit()
-        self.chat_text_edit.setReadOnly(True)
-        self.chat_text_edit.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.chat_text_edit.setFrameStyle(QFrame.NoFrame)
-        self.chat_text_edit.setStyleSheet("""
-            background-color: rgba(20, 20, 30, 0.9);
-            color: #00D4FF;
-            border-radius: 10px;
-            padding: 15px;
-            font-family: 'Arial';
-            font-size: 18px;
-        """)
-        layout.addWidget(self.chat_text_edit)
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setFrameStyle(QFrame.NoFrame)
+        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.scroll_area.setAccessibleName("Conversation")
 
-        font = QFont("Arial", 18, QFont.Weight.Medium)
-        self.chat_text_edit.setFont(font)
-        self.chat_text_edit.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.chat_text_edit.customContextMenuRequested.connect(self.show_context_menu)
-
-        self.typing_label = QLabel()
-        typing_movie = QMovie(GraphicsDirectoryPath('Typing.gif'))
-        typing_movie.setScaledSize(QSize(50, 50))
-        self.typing_label.setMovie(typing_movie)
-        self.typing_label.setAlignment(Qt.AlignRight)
-        self.typing_label.hide()
-        layout.addWidget(self.typing_label)
+        self._message_list = QWidget()
+        self._message_layout = QVBoxLayout(self._message_list)
+        self._message_layout.setContentsMargins(10, 10, 10, 10)
+        self._message_layout.setSpacing(10)
+        self._empty_state = self._build_empty_state()
+        self._message_layout.addWidget(self._empty_state)
+        self._message_layout.addStretch(1)  # keeps short conversations pinned to the top
+        self.scroll_area.setWidget(self._message_list)
+        layout.addWidget(self.scroll_area, 1)
 
         input_layout = QHBoxLayout()
         self.input_field = QLineEdit()
         self.input_field.setPlaceholderText("Type your query...")
-        self.input_field.setStyleSheet("""
-            background-color: rgba(20, 20, 30, 0.9);
-            color: #00D4FF;
-            border-radius: 10px;
-            padding: 8px;
-            font-family: 'Arial';
-            font-size: 18px;
-        """)
+        self.input_field.setAccessibleName("Message input")
+        self.input_field.returnPressed.connect(self.send_query)
         send_button = QPushButton("Send")
-        send_button.setStyleSheet("""
-            QPushButton {
-                background-color: #00D4FF;
-                color: black;
-                border-radius: 10px;
-                padding: 8px;
-                font-family: 'Arial';
-            }
-            QPushButton:hover {
-                background-color: #00BFFF;
-            }
-        """)
+        send_button.setAccessibleName("Send message")
         send_button.clicked.connect(self.send_query)
         upload_button = QPushButton("Upload File")
-        upload_button.setStyleSheet("""
-            QPushButton {
-                background-color: #00D4FF;
-                color: black;
-                border-radius: 10px;
-                padding: 8px;
-                font-family: 'Arial';
-            }
-            QPushButton:hover {
-                background-color: #00BFFF;
-            }
-        """)
+        upload_button.setAccessibleName("Upload file")
         upload_button.clicked.connect(self.upload_file)
         input_layout.addWidget(self.input_field)
         input_layout.addWidget(send_button)
         input_layout.addWidget(upload_button)
         layout.addLayout(input_layout)
 
-        self.gif_label = QLabel()
-        self.gif_label.setStyleSheet("border: none;")
-        movie = QMovie(GraphicsDirectoryPath('Jarvis.gif'))
-        max_gif_size_W = 400
-        max_gif_size_H = 225
-        movie.setScaledSize(QSize(max_gif_size_W, max_gif_size_H))
-        self.gif_label.setAlignment(Qt.AlignRight | Qt.AlignBottom)
-        self.gif_label.setMovie(movie)
-        movie.start()
-        layout.addWidget(self.gif_label)
+    # ── slots: worker -> here ──
+    @pyqtSlot(str)
+    def on_user_message(self, message):
+        self._current_bubble = None  # a new turn starts; any prior assistant bubble is done
+        bubble = MessageBubble("user", "You")
+        bubble.apply_theme(theme.active())
+        bubble.set_text(message)
+        self._add_bubble(bubble)
 
-        self.label = QLabel("")
-        self.label.setStyleSheet("""
-            color: #00D4FF;
-            font-size: 16px;
-            font-family: 'Arial';
-            margin-right: 150px;
-            border: none;
-            margin-top: -20px;
-        """)
-        self.label.setAlignment(Qt.AlignRight)
-        layout.addWidget(self.label)
+    @pyqtSlot(str)
+    def on_token(self, token):
+        self._ensure_assistant_bubble().append_token(token)
+        self.scroll_to_bottom()
 
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.loadMessages)
-        self.timer.timeout.connect(self.SpeechRecogText)
-        self.timer.start(5)
+    @pyqtSlot(str)
+    def on_response(self, message):
+        # Authoritative final text — overwrites whatever on_token() streamed
+        # in, in case the two ever drift (e.g. a response that arrived with
+        # no preceding tokens, see AgentWorker._emit_initial_history).
+        self._ensure_assistant_bubble().set_text(message)
+        self._current_bubble = None  # turn over; the next token/tool call starts a fresh bubble
+        self.scroll_to_bottom()
 
-        self.setStyleSheet("""
-            QScrollBar:vertical {
-                border: none;
-                background: rgba(20, 20, 30, 0.9);
-                width: 8px;
-                margin: 0px 0px 0px 0px;
-                border-radius: 4px;
-            }
-            QScrollBar::handle:vertical {
-                background: #00D4FF;
-                min-height: 20px;
-                border-radius: 4px;
-            }
-            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
-                background: none;
-                height: 0px;
-            }
-            QScrollBar::up-arrow:vertical, QScrollBar::down-arrow:vertical {
-                border: none;
-                background: none;
-            }
-            QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
-                background: none;
-            }
-        """)
+    @pyqtSlot(str, dict)
+    def on_tool_started(self, name, args):
+        self._ensure_assistant_bubble().tool_started(name, args)
+        self.scroll_to_bottom()
 
-    def loadMessages(self):
-        global old_chat_message
-        with open(TempDirectoryPath('Responses.data'), "r", encoding='utf-8') as file:
-            messages = file.read()
-            if not messages or len(messages) <= 1 or str(old_chat_message) == str(messages):
-                return
-            self.addMessage(f"{Assistantname}: {messages}", "#00D4FF")
-            old_chat_message = messages
-        status = GetAssistantStatus()
-        if status == "Processing":
-            self.typing_label.show()
-            self.typing_label.movie().start()
+    @pyqtSlot(str, str)
+    def on_tool_finished(self, name, result):
+        self._ensure_assistant_bubble().tool_finished(name, result)
+        self.scroll_to_bottom()
+
+    @pyqtSlot(str)
+    def on_error(self, message):
+        bubble = MessageBubble("error", "Error")
+        bubble.apply_theme(theme.active())
+        bubble.set_text(message)
+        self._add_bubble(bubble)
+
+    @pyqtSlot(str)
+    def on_reminder(self, message):
+        """Backend.scheduler_worker.SchedulerWorker.reminder_fired (Phase
+        4.2). Deliberately its own bubble, not routed through
+        _ensure_assistant_bubble() — a reminder can fire at any moment,
+        including mid-stream of an unrelated AgentWorker turn, and
+        shouldn't get folded into (or reset) that turn's in-progress
+        bubble state."""
+        bubble = MessageBubble("assistant", Assistantname)
+        bubble.apply_theme(theme.active())
+        bubble.set_text(f"⏰ Reminder: {message}")
+        self._add_bubble(bubble)
+
+    @pyqtSlot(str)
+    def on_briefing(self, text):
+        """Backend.scheduler_worker.SchedulerWorker.briefing_fired (Phase 4.3)."""
+        bubble = MessageBubble("assistant", Assistantname)
+        bubble.apply_theme(theme.active())
+        bubble.set_text(text)
+        self._add_bubble(bubble)
+
+    # ── empty state (Phase 5.5) ──
+    def _build_empty_state(self) -> QWidget:
+        """Shown when there's genuinely nothing in the conversation — a
+        fresh install with no history, or after Ctrl+L clears the current
+        session. Before this the pane was just blank; see
+        ENHANCEMENT_PLAN.md 5.5."""
+        examples = [
+            "What's the weather like today?",
+            "Search the web for the latest AI news",
+            "Remind me to take a break in 20 minutes",
+        ]
+        w = QWidget()
+        w.setAccessibleName("Empty conversation state")
+        layout = QVBoxLayout(w)
+        layout.setContentsMargins(20, 40, 20, 20)
+        layout.setSpacing(12)
+        title = QLabel(f"Ask {Assistantname} anything")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet("font-size: 20px; font-weight: 600; background: transparent;")
+        layout.addWidget(title)
+        subtitle = QLabel("Try one of these to get started:")
+        subtitle.setAlignment(Qt.AlignCenter)
+        subtitle.setStyleSheet("background: transparent;")
+        layout.addWidget(subtitle)
+        for example in examples:
+            btn = QPushButton(example)
+            btn.setAccessibleName(f"Example query: {example}")
+            btn.clicked.connect(lambda _checked=False, q=example: self.query_submitted.emit(q))
+            layout.addWidget(btn)
+        return w
+
+    def _update_empty_state(self):
+        self._empty_state.setVisible(self._message_count == 0)
+
+    def clear_messages(self):
+        """Removes every message row (Ctrl+L / switching to a different
+        history session) and restores the empty state."""
+        while self._message_layout.count() > 2:  # empty_state + trailing stretch stay
+            item = self._message_layout.takeAt(1)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._current_bubble = None
+        self._message_count = 0
+        self._update_empty_state()
+
+    def load_history(self, entries):
+        """Replays a list of {"role", "content"} dicts (Backend.Database.
+        get_chat_history's shape) into the pane — used when the history
+        sidebar switches the active session."""
+        self.clear_messages()
+        for entry in entries:
+            if entry["role"] == "user":
+                self.on_user_message(entry["content"])
+            elif entry["role"] == "assistant":
+                self.on_response(entry["content"])
+
+    # ── internals ──
+    def _ensure_assistant_bubble(self) -> MessageBubble:
+        if self._current_bubble is None:
+            self._current_bubble = MessageBubble("assistant", Assistantname)
+            self._current_bubble.apply_theme(theme.active())
+            self._add_bubble(self._current_bubble)
+        return self._current_bubble
+
+    def _add_bubble(self, bubble: MessageBubble):
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        if bubble.role == "user":
+            row.addStretch(1)
+            row.addWidget(bubble)
         else:
-            self.typing_label.hide()
+            row.addWidget(bubble)
+            row.addStretch(1)
+        row_widget = QWidget()
+        row_widget.setLayout(row)
+        # Insert before the trailing stretch (always the last item), so new
+        # rows land at the bottom instead of after it.
+        self._message_layout.insertWidget(self._message_layout.count() - 1, row_widget)
+        self._message_count += 1
+        self._update_empty_state()
+        self.scroll_to_bottom()
 
-    def SpeechRecogText(self):
-        with open(TempDirectoryPath('Status.data'), "r", encoding='utf-8') as file:
-            messages = file.read()
-            self.label.setText(messages)
+    def scroll_to_bottom(self):
+        bar = self.scroll_area.verticalScrollBar()
+        # The scroll area hasn't re-laid-out yet at the moment a bubble is
+        # added/edited, so bar.maximum() would still be the *old* max — defer
+        # one event-loop tick so layout has actually happened first.
+        QTimer.singleShot(0, lambda: bar.setValue(bar.maximum()))
 
-    def addMessage(self, message, color):
-        cursor = self.chat_text_edit.textCursor()
-        cursor.movePosition(cursor.End)
-        format = QTextCharFormat()
-        format.setForeground(QColor(color))
-        if "**" in message:
-            message = message.replace("**", "<b>", 1).replace("**", "</b>", 1)
-        cursor.insertHtml(f'<p style="margin: 20px 15px; color: {color}; line-height: 1.5;">{message}</p>')
-        cursor.insertHtml('<br>')  # Ensure extra line break for separation
-        self.chat_text_edit.setTextCursor(cursor)
-        self.chat_text_edit.ensureCursorVisible()
+    def retheme(self, tokens: dict):
+        """Called by MainWindow.apply_theme() on every existing bubble —
+        the global QApplication stylesheet only covers widgets with no
+        role-dependent colour, which a bubble's background is (see
+        Frontend/theme.py's stylesheet() docstring)."""
+        for i in range(self._message_layout.count() - 1):  # skip the trailing stretch
+            row_widget = self._message_layout.itemAt(i).widget()
+            if row_widget is None:
+                continue
+            for bubble in row_widget.findChildren(MessageBubble):
+                bubble.apply_theme(tokens)
 
+    # ── GUI -> worker ──
     def send_query(self):
         query = self.input_field.text().strip()
         if query:
             modified_query = QueryModifier(query)
-            self.addMessage(f"You: {modified_query}", "#FFFFFF")
             self.input_field.clear()
-            with open(TempDirectoryPath('Query.data'), "w", encoding='utf-8') as file:
-                file.write(modified_query)
+            self.query_submitted.emit(modified_query)
 
     def upload_file(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "Select File", "", "All Files (*);;Images (*.png *.jpg);;PDFs (*.pdf)")
         if file_path:
-            self.addMessage(f"Uploaded: {os.path.basename(file_path)}", "#00D4FF")
-            with open(TempDirectoryPath('UploadedFile.data'), "w", encoding='utf-8') as file:
-                file.write(file_path)
-
-    def show_context_menu(self, pos):
-        menu = QMenu()
-        copy_action = menu.addAction("Copy")
-        delete_action = menu.addAction("Delete")
-        action = menu.exec_(self.chat_text_edit.mapToGlobal(pos))
-        if action == copy_action:
-            self.chat_text_edit.copy()
-        elif action == delete_action:
-            self.chat_text_edit.clear()
+            bubble = MessageBubble("user", "You")
+            bubble.apply_theme(theme.active())
+            bubble.set_text(f"📎 Uploaded: {os.path.basename(file_path)}")
+            self._add_bubble(bubble)
+            self.file_uploaded.emit(file_path)
 
 class CircularVisualizer(QWidget):
-    """A circular audio visualizer with animated bars, glowing orb, and state-driven colors."""
+    """A circular audio visualizer with animated bars, glowing orb, and state-driven colors.
+
+    Phase 5.4 (see ENHANCEMENT_PLAN.md): bar heights used to come purely
+    from math.sin() + random.uniform() — decorative, not connected to any
+    real audio. setLevel() now feeds it the actual signal: mic RMS during
+    listening (Backend/SpeechToText.py), decoded TTS-output RMS during
+    speaking (Backend/TextToSpeech.py), both routed through
+    AgentWorker.audio_level. There's no per-band spectrum here (that would
+    need either a multi-band FFT streamed off the mic or a raw PCM output
+    path — out of scope, see Backend/barge_in.py's docstring for the same
+    call on the TTS side) — one scalar RMS level is distributed across the
+    ring with a per-bar phase offset so it still reads as motion rather
+    than a single pulsing blob. If no level has arrived recently (state has
+    no audio behind it — thinking, tool, idle), bars fall back to the
+    original gentle synthetic animation instead of sitting frozen.
+    """
     NUM_BARS = 64
+    _LEVEL_TIMEOUT_S = 0.4  # no fresh level within this long -> treat as silence, use synthetic idle motion
     STATE_COLORS = {
         'listening':  (0, 212, 255),     # Cyan
         'recognizing': (0, 212, 255),
@@ -291,6 +381,9 @@ class CircularVisualizer(QWidget):
         self._phase = 0.0          # animation phase counter
         self._pulse = 0.0          # pulse ring radius offset
         self._pulse_dir = 1
+        self._level = 0.0          # last real audio_level received (Phase 5.4)
+        self._last_level_ts = 0.0
+        self._reduced_motion = _system_prefers_reduced_motion()  # Phase 5.6
 
         # 30 FPS animation timer
         self._anim_timer = QTimer(self)
@@ -299,7 +392,7 @@ class CircularVisualizer(QWidget):
 
     # ----- public API -----
     def setState(self, status_text: str):
-        """Map the status string from Status.data to an internal state key."""
+        """Map a status string (from AgentWorker.state_changed) to an internal state key."""
         t = status_text.lower()
         for key in self.STATE_COLORS:
             if key in t:
@@ -307,18 +400,46 @@ class CircularVisualizer(QWidget):
                 return
         self._state = 'available'
 
+    def setLevel(self, level: float):
+        """Feed a real 0.0-1.0 RMS audio level (Phase 5.4). Connected to
+        AgentWorker.audio_level in MainWindow.attach_worker()."""
+        self._level = max(0.0, min(1.0, level))
+        self._last_level_ts = time.monotonic()
+
     # ----- internal animation -----
     def _tick(self):
+        if self._reduced_motion:
+            # Phase 5.6: OS-level "reduce animations" respected — a static
+            # ring at a fixed height, still recoloured per state (state is
+            # never conveyed by colour alone here either; see setState()'s
+            # caller, which also updates the status label text), just no
+            # motion. No pulse, no per-bar variation.
+            for i in range(self.NUM_BARS):
+                self._bars[i] = 0.22
+            self.update()
+            return
+
         self._phase += 0.06
         # Pulse ring
         self._pulse += 0.4 * self._pulse_dir
         if self._pulse > 12 or self._pulse < -4:
             self._pulse_dir *= -1
 
-        # Generate target bar heights based on state
         active = self._state not in ('available',)
+        level_is_fresh = (time.monotonic() - self._last_level_ts) < self._LEVEL_TIMEOUT_S
+
+        # Generate target bar heights based on state
         for i in range(self.NUM_BARS):
-            if active:
+            if active and level_is_fresh:
+                # Real signal: one scalar RMS level spread around the ring
+                # with a per-bar phase offset (see class docstring — there's
+                # no real per-band spectrum data available), so a sustained
+                # tone still reads as motion rather than a static ring.
+                wave = 0.5 + 0.5 * math.sin(self._phase * 2.5 + i * 0.35)
+                self._target_bars[i] = max(0.05, min(1.0, self._level * (0.6 + 0.4 * wave)))
+            elif active:
+                # No fresh level (e.g. "thinking"/"tool" — nothing is
+                # actually making sound) — original synthetic wave.
                 wave = 0.35 + 0.35 * math.sin(self._phase * 2.5 + i * 0.35)
                 noise = random.uniform(-0.12, 0.12)
                 self._target_bars[i] = max(0.08, min(1.0, wave + noise))
@@ -398,17 +519,21 @@ class CircularVisualizer(QWidget):
 
 
 class InitialScreen(QWidget):
+    # GUI -> worker
+    mic_toggled = pyqtSignal(bool)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         desktop = QApplication.desktop()
         screen_width = desktop.screenGeometry().width()
         screen_height = desktop.screenGeometry().height()
         scale_factor = min(screen_width / 1920, screen_height / 1080)
+        self._scale_factor = scale_factor
 
         content_layout = QVBoxLayout()
         content_layout.setContentsMargins(0, 0, 0, int(100 * scale_factor))
 
-        # ---- Circular Audio Visualizer (replaces old GIF) ----
+        # ---- Circular Audio Visualizer ----
         vis_size = int(380 * scale_factor)
         self.visualizer = CircularVisualizer(size=vis_size)
 
@@ -419,22 +544,16 @@ class InitialScreen(QWidget):
         self.icon_label.setPixmap(new_pixmap)
         self.icon_label.setFixedSize(int(100 * scale_factor), int(100 * scale_factor))
         self.icon_label.setAlignment(Qt.AlignCenter)
-        self.icon_label.setStyleSheet("""
-            background-color: rgba(0, 212, 255, 0.2);
-            border-radius: 50px;
-            padding: 10px;
-        """)
-        self.toggled = True
-        self.toggle_icon()
-        self.icon_label.mousePressEvent = self.toggle_icon
+        self.mic_enabled = True  # mic starts ON, matching prior default behavior
+        self._render_mic_icon()
+        # A standard, working PyQt5 idiom (wire an event handler onto a
+        # plain QLabel instance instead of subclassing it just for this) —
+        # mypy's method-assign check is right that overwriting a method in
+        # general is unsound, but for a Qt event-handler slot specifically,
+        # this is the normal pattern, not a mistake.
+        self.icon_label.mousePressEvent = self.toggle_icon  # type: ignore[method-assign]
 
         self.label = QLabel("")
-        self.label.setStyleSheet("""
-            color: #00D4FF;
-            font-size: 18px;
-            font-family: 'Arial';
-            margin-bottom: 20px;
-        """)
 
         content_layout.addStretch(1)
         content_layout.addWidget(self.visualizer, alignment=Qt.AlignCenter)
@@ -442,73 +561,88 @@ class InitialScreen(QWidget):
         content_layout.addWidget(self.icon_label, alignment=Qt.AlignCenter)
         content_layout.addStretch(1)
         self.setLayout(content_layout)
-        self.setFixedHeight(screen_height)
-        self.setFixedWidth(screen_width)
-
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.SpeechRecogText)
-        self.timer.start(5)
+        # No more setFixedHeight/Width(screen_*) here (Phase 5.5, see
+        # ENHANCEMENT_PLAN.md "Window behavior") — QStackedWidget already
+        # sizes each page to fill whatever the actual window is, and a
+        # fixed size tied to the *desktop* resolution fought a resizable
+        # window that's smaller (or larger, across a monitor change) than
+        # that.
+        self.retheme(theme.active())
 
     def paintEvent(self, event):
+        t = theme.active()
         painter = QPainter(self)
         gradient = QLinearGradient(0, 0, 0, self.height())
-        gradient.setColorAt(0, QColor(20, 20, 30))
-        gradient.setColorAt(1, QColor(0, 0, 20))
+        gradient.setColorAt(0, QColor(t["bg"]))
+        gradient.setColorAt(1, QColor(t["surface"]))
         painter.fillRect(self.rect(), gradient)
         super().paintEvent(event)
 
-    def SpeechRecogText(self):
-        with open(TempDirectoryPath('Status.data'), "r", encoding='utf-8') as file:
-            messages = file.read()
-            self.label.setText(messages)
-            self.visualizer.setState(messages)
+    def retheme(self, tokens: dict):
+        self.icon_label.setStyleSheet(f"""
+            background-color: {tokens['accent']}33;
+            border-radius: 50px;
+            padding: 10px;
+        """)
+        self.label.setStyleSheet(f"""
+            color: {tokens['accent']};
+            font-size: 18px;
+            font-family: 'Segoe UI', Arial;
+            margin-bottom: 20px;
+            background: transparent;
+        """)
+        self.update()
 
-    def load_icon(self, path, width, height):
-        pixmap = QPixmap(path)
-        new_pixmap = pixmap.scaled(width, height, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        self.icon_label.setPixmap(new_pixmap)
+    # ── slot: worker -> here ──
+    @pyqtSlot(str)
+    def on_status(self, status):
+        self.label.setText(status)
+        self.visualizer.setState(status)
+
+    def _render_mic_icon(self):
+        icon_name = 'Mic_on.png' if self.mic_enabled else 'Mic_off.png'
+        pixmap = QPixmap(GraphicsDirectoryPath(icon_name))
+        size = int(80 * self._scale_factor)
+        self.icon_label.setPixmap(pixmap.scaled(size, size, Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
     def toggle_icon(self, event=None):
-        scale_factor = min(QApplication.desktop().screenGeometry().width() / 1920, 
-                          QApplication.desktop().screenGeometry().height() / 1080)
-        if self.toggled:
-            # Mic is ON -> show ON icon and set status to True (listening)
-            self.load_icon(GraphicsDirectoryPath('Mic_on.png'), int(80 * scale_factor), int(80 * scale_factor))
-            SetMicrophoneStatus("True")
-        else:
-            # Mic is OFF -> show OFF icon and set status to False (paused)
-            self.load_icon(GraphicsDirectoryPath('Mic_off.png'), int(80 * scale_factor), int(80 * scale_factor))
-            SetMicrophoneStatus("False")
-        self.toggled = not self.toggled
+        self.mic_enabled = not self.mic_enabled
+        self._render_mic_icon()
+        self.mic_toggled.emit(self.mic_enabled)
 
 class MessageScreen(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        desktop = QApplication.desktop()
-        screen_width = desktop.screenGeometry().width()
-        screen_height = desktop.screenGeometry().height()
-
+        # No setFixedHeight/Width(screen_*) — see InitialScreen's __init__
+        # for why (Phase 5.5, resizable window).
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
-        chat_section = ChatSection()
-        layout.addWidget(chat_section)
+        self.chat_section = ChatSection()
+        layout.addWidget(self.chat_section)
         self.setLayout(layout)
-        self.setFixedHeight(screen_height)
-        self.setFixedWidth(screen_width)
 
     def paintEvent(self, event):
+        t = theme.active()
         painter = QPainter(self)
         gradient = QLinearGradient(0, 0, 0, self.height())
-        gradient.setColorAt(0, QColor(20, 20, 30))
-        gradient.setColorAt(1, QColor(0, 0, 20))
+        gradient.setColorAt(0, QColor(t["bg"]))
+        gradient.setColorAt(1, QColor(t["surface"]))
         painter.fillRect(self.rect(), gradient)
         super().paintEvent(event)
 
 class CustomTopBar(QWidget):
-    def __init__(self, parent, stacked_widget):
+    def __init__(self, parent: "MainWindow", stacked_widget):
         super().__init__(parent)
+        # Stored separately from Qt's own self.parent() (which every method
+        # below used to call directly): self.parent() is typed to return
+        # the *base* QObject | None — correct for an arbitrary QWidget, but
+        # every call site here needs the concrete MainWindow methods/
+        # attributes (toggle_history_sidebar, apply_theme, ...), which
+        # QObject doesn't have. parent is always actually a MainWindow (see
+        # every construction site of this class), so this is a real type,
+        # not a cast papering over a mismatch.
+        self._main_window = parent
         self.stacked_widget = stacked_widget
-        self.theme = "dark"
         self.initUI()
 
     def initUI(self):
@@ -517,166 +651,135 @@ class CustomTopBar(QWidget):
         layout.setAlignment(Qt.AlignRight)
         layout.setContentsMargins(10, 5, 10, 5)
 
-        title_label = QLabel(f" {str(Assistantname).capitalize()} AI ")
-        title_label.setStyleSheet("""
-            color: #00D4FF;
-            font-size: 20px;
-            font-family: 'Arial';
-            font-weight: bold;
-            background: transparent;
-        """)
+        # Home/Chat/Theme get their look for free from the app-wide
+        # QPushButton rule in Frontend.theme.stylesheet() (set in
+        # MainWindow.apply_theme()) — no per-button stylesheet needed, and
+        # a theme toggle now actually re-colours them, unlike before.
+        self.title_label = QLabel(f" {str(Assistantname).capitalize()} AI ")
+        self.title_label.setObjectName("TopBarTitle")
 
         home_button = QPushButton(" Home")
-        home_icon = QIcon(GraphicsDirectoryPath("Home.png"))
-        home_button.setIcon(home_icon)
-        home_button.setStyleSheet("""
-            QPushButton {
-                background-color: #00D4FF;
-                color: black;
-                border-radius: 15px;
-                padding: 8px 16px;
-                font-family: 'Arial';
-                font-size: 14px;
-            }
-            QPushButton:hover {
-                background-color: #00BFFF;
-            }
-        """)
+        home_button.setIcon(QIcon(GraphicsDirectoryPath("Home.png")))
+        home_button.setAccessibleName("Home screen")
         home_button.clicked.connect(lambda: self.stacked_widget.setCurrentIndex(0))
 
         message_button = QPushButton(" Chat")
-        message_icon = QIcon(GraphicsDirectoryPath("Chats.png"))
-        message_button.setIcon(message_icon)
-        message_button.setStyleSheet("""
-            QPushButton {
-                background-color: #00D4FF;
-                color: black;
-                border-radius: 15px;
-                padding: 8px 16px;
-                font-family: 'Arial';
-                font-size: 14px;
-            }
-            QPushButton:hover {
-                background-color: #00BFFF;
-            }
-        """)
+        message_button.setIcon(QIcon(GraphicsDirectoryPath("Chats.png")))
+        message_button.setAccessibleName("Chat screen")
         message_button.clicked.connect(lambda: self.stacked_widget.setCurrentIndex(1))
 
         theme_button = QPushButton("Toggle Theme")
-        theme_button.setStyleSheet("""
-            QPushButton {
-                background-color: #00D4FF;
-                color: black;
-                border-radius: 15px;
-                padding: 8px 16px;
-                font-family: 'Arial';
-                font-size: 14px;
-            }
-            QPushButton:hover {
-                background-color: #00BFFF;
-            }
-        """)
+        theme_button.setAccessibleName("Toggle theme")
         theme_button.clicked.connect(self.toggle_theme)
 
-        minimize_button = QPushButton()
-        minimize_icon = QIcon(GraphicsDirectoryPath('Minimize2.png'))
-        minimize_button.setIcon(minimize_icon)
-        minimize_button.setStyleSheet("""
-            QPushButton {
-                background-color: #FF4C4C;
-                border-radius: 15px;
-                padding: 8px;
-            }
-            QPushButton:hover {
-                background-color: #FF6666;
-            }
-        """)
-        minimize_button.clicked.connect(self.minimizeWindow)
+        # Phase 5.5: the three panels that used to have no way in —
+        # Settings.png existed and was wired to nothing, get_usage_summary()
+        # was imported and never called, and the history table had a
+        # get_all_chat_history() nobody displayed grouped by session.
+        history_button = QPushButton(" History")
+        history_button.setAccessibleName("Toggle conversation history")
+        history_button.clicked.connect(lambda: self._main_window.toggle_history_sidebar())
+
+        stats_button = QPushButton(" Stats")
+        stats_button.setAccessibleName("Usage statistics")
+        stats_button.clicked.connect(lambda: self._main_window.open_stats())
+
+        settings_button = QPushButton()
+        settings_button.setIcon(QIcon(GraphicsDirectoryPath("Settings.png")))
+        settings_button.setAccessibleName("Open settings")
+        settings_button.clicked.connect(lambda: self._main_window.open_settings())
+
+        fullscreen_button = QPushButton("⛶")
+        fullscreen_button.setAccessibleName("Toggle fullscreen")
+        fullscreen_button.clicked.connect(lambda: self._main_window.toggle_fullscreen())
+
+        # Window-control buttons keep a distinct "danger" red rather than
+        # the accent colour — that's intentional, not left over from the
+        # old hardcoded styling, so it's still tokens['error'] rather than
+        # a literal #FF4C4C.
+        self.minimize_button = QPushButton()
+        self.minimize_button.setIcon(QIcon(GraphicsDirectoryPath('Minimize2.png')))
+        self.minimize_button.setAccessibleName("Minimize window")
+        self.minimize_button.clicked.connect(self.minimizeWindow)
 
         self.maximize_button = QPushButton()
         self.maximize_icon = QIcon(GraphicsDirectoryPath('Maximize.png'))
         self.restore_icon = QIcon(GraphicsDirectoryPath('Minimize.png'))
         self.maximize_button.setIcon(self.maximize_icon)
-        self.maximize_button.setStyleSheet("""
-            QPushButton {
-                background-color: #FF4C4C;
-                border-radius: 15px;
-                padding: 8px;
-            }
-            QPushButton:hover {
-                background-color: #FF6666;
-            }
-        """)
+        self.maximize_button.setAccessibleName("Maximize window")
         self.maximize_button.clicked.connect(self.maximizeWindow)
 
-        close_button = QPushButton()
-        close_icon = QIcon(GraphicsDirectoryPath('Close.png'))
-        close_button.setIcon(close_icon)
-        close_button.setStyleSheet("""
-            QPushButton {
-                background-color: #FF4C4C;
-                border-radius: 15px;
-                padding: 8px;
-            }
-            QPushButton:hover {
-                background-color: #FF6666;
-            }
-        """)
-        close_button.clicked.connect(self.closeWindow)
+        self.close_button = QPushButton()
+        self.close_button.setIcon(QIcon(GraphicsDirectoryPath('Close.png')))
+        self.close_button.setAccessibleName("Close window")
+        self.close_button.clicked.connect(self.closeWindow)
 
-        layout.addWidget(title_label)
+        layout.addWidget(self.title_label)
         layout.addStretch(1)
         layout.addWidget(home_button)
         layout.addWidget(message_button)
+        layout.addWidget(history_button)
+        layout.addWidget(stats_button)
+        layout.addWidget(settings_button)
         layout.addWidget(theme_button)
+        layout.addWidget(fullscreen_button)
         layout.addSpacing(10)
-        layout.addWidget(minimize_button)
+        layout.addWidget(self.minimize_button)
         layout.addWidget(self.maximize_button)
-        layout.addWidget(close_button)
+        layout.addWidget(self.close_button)
 
         self.draggable = True
         self.offset = None
+        self.retheme(theme.active())
 
     def paintEvent(self, event):
+        t = theme.active()
         painter = QPainter(self)
         gradient = QLinearGradient(0, 0, 0, self.height())
-        if self.theme == "dark":
-            gradient.setColorAt(0, QColor(30, 30, 50))
-            gradient.setColorAt(1, QColor(10, 10, 30))
-        else:
-            gradient.setColorAt(0, QColor(200, 200, 220))
-            gradient.setColorAt(1, QColor(180, 180, 200))
+        gradient.setColorAt(0, QColor(t["surface_2"]))
+        gradient.setColorAt(1, QColor(t["bg"]))
         painter.fillRect(self.rect(), gradient)
         super().paintEvent(event)
 
-    def toggle_theme(self):
-        if self.theme == "dark":
-            self.theme = "light"
-            self.parent().setStyleSheet("""
-                QWidget { background-color: #FFFFFF; color: #000000; }
-                QTextEdit { background-color: #F0F0F0; color: #000000; }
-                QLineEdit { background-color: #F0F0F0; color: #000000; }
-                QPushButton { background-color: #00BFFF; color: #FFFFFF; }
-                QLabel { color: #000000; }
-            """)
-        else:
-            self.theme = "dark"
-            self.parent().setStyleSheet("")
+    def retheme(self, tokens: dict):
+        self.title_label.setStyleSheet(f"""
+            color: {tokens['accent']};
+            font-size: 20px;
+            font-family: 'Segoe UI', Arial;
+            font-weight: bold;
+            background: transparent;
+        """)
+        danger_style = f"""
+            QPushButton {{
+                background-color: {tokens['error']};
+                border-radius: 15px;
+                padding: 8px;
+            }}
+            QPushButton:hover {{
+                background-color: {tokens['warning']};
+            }}
+        """
+        for btn in (self.minimize_button, self.maximize_button, self.close_button):
+            btn.setStyleSheet(danger_style)
         self.update()
 
+    def toggle_theme(self):
+        next_name = "light" if theme.current_name() == "dark" else "dark"
+        self._main_window.apply_theme(next_name)
+
     def minimizeWindow(self):
-        self.parent().showMinimized()
+        self._main_window.showMinimized()
 
     def maximizeWindow(self):
-        if self.parent().isMaximized():
-            self.parent().showNormal()
+        if self._main_window.isMaximized():
+            self._main_window.showNormal()
             self.maximize_button.setIcon(self.maximize_icon)
         else:
-            self.parent().showMaximized()
+            self._main_window.showMaximized()
             self.maximize_button.setIcon(self.restore_icon)
 
     def closeWindow(self):
-        self.parent().close()
+        self._main_window.close()
 
     def mousePressEvent(self, event):
         if self.draggable:
@@ -685,42 +788,338 @@ class CustomTopBar(QWidget):
     def mouseMoveEvent(self, event):
         if self.draggable and self.offset:
             new_pos = event.globalPos() - self.offset
-            self.parent().move(new_pos)
+            self._main_window.move(new_pos)
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+        self._worker = None
+        self._force_quit = False  # set by the tray's Quit action / Ctrl+Q; see closeEvent()
+        # Always set for real by _setup_tray() before this window can ever
+        # process a close event — declared here (rather than relying on
+        # getattr(self, "tray", None) at the one place it's read) so mypy
+        # knows the attribute genuinely always exists by then.
+        self.tray: QSystemTrayIcon | None = None
         self.setWindowFlags(Qt.FramelessWindowHint)
         self.initUI()
 
     def initUI(self):
-        desktop = QApplication.desktop()
-        screen_width = desktop.screenGeometry().width()
-        screen_height = desktop.screenGeometry().height()
-
         self.stacked_widget = QStackedWidget(self)
-        initial_screen = InitialScreen()
-        message_screen = MessageScreen()
-        self.stacked_widget.addWidget(initial_screen)
-        self.stacked_widget.addWidget(message_screen)
+        self.initial_screen = InitialScreen()
+        self.message_screen = MessageScreen()
+        self.stacked_widget.addWidget(self.initial_screen)
+        self.stacked_widget.addWidget(self.message_screen)
 
-        self.setGeometry(0, 0, screen_width, screen_height)
         top_bar = CustomTopBar(self, self.stacked_widget)
         self.setMenuWidget(top_bar)
-        self.setCentralWidget(self.stacked_widget)
 
-        self.statusBar = QStatusBar()
-        self.setStatusBar(self.statusBar)
-        self.statusBar.showMessage("Ready")
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.update_status)
-        self.timer.start(1000)
+        # Phase 5.5: the history sidebar docks alongside the stacked pages
+        # rather than floating, so it doesn't cover the visualizer/chat.
+        central = QWidget()
+        central_layout = QHBoxLayout(central)
+        central_layout.setContentsMargins(0, 0, 0, 0)
+        central_layout.setSpacing(0)
+        central_layout.addWidget(self.stacked_widget, 1)
+        self.history_sidebar = HistorySidebar()
+        self.history_sidebar.hide()
+        self.history_sidebar.session_selected.connect(self._on_session_selected)
+        central_layout.addWidget(self.history_sidebar)
+        self.setCentralWidget(central)
 
-    def update_status(self):
-        status = GetAssistantStatus()
-        self.statusBar.showMessage(status)
+        # Named _status_bar, not statusBar — QMainWindow already has a
+        # statusBar() *method*; an instance attribute of the same name
+        # shadows it (Python allows this, so it silently "worked", but
+        # mypy correctly flags every use as calling methods QMainWindow's
+        # own statusBar() return type doesn't have — this ambiguity is
+        # exactly what the name collision causes).
+        self._status_bar = QStatusBar()
+        self.setStatusBar(self._status_bar)
+        # A frameless window (Qt.FramelessWindowHint, above) gets no native
+        # resize border from Windows — QStatusBar's built-in QSizeGrip is
+        # what makes this "a normal resizable window" (ENHANCEMENT_PLAN.md
+        # 5.5) rather than the old fixed-fullscreen one: drag the bottom-
+        # right corner. It's the one resize handle, not full edge-dragging,
+        # but it's a real, working one for a modest amount of code.
+        self._status_bar.setSizeGripEnabled(True)
+        self._status_bar.showMessage("Ready")
+
+        self.toasts = ToastManager(self)
+
+        self._top_bar = top_bar
+        self.apply_theme(theme.current_name())
+
+        self._restore_geometry()
+        self._setup_tray()
+        self._setup_shortcuts()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "toasts"):
+            self.toasts.reposition()
+
+    # ── window geometry (Phase 5.5 "Window behavior") ──
+    def _restore_geometry(self):
+        qsettings = QSettings("Jarvis", "JarvisAssistant")
+        saved = qsettings.value("window_geometry")
+        if saved is not None:
+            self.restoreGeometry(saved)
+        else:
+            self.resize(1200, 800)
+            screen = QApplication.desktop().screenGeometry()
+            self.move((screen.width() - self.width()) // 2, (screen.height() - self.height()) // 2)
+
+    def _save_geometry(self):
+        qsettings = QSettings("Jarvis", "JarvisAssistant")
+        qsettings.setValue("window_geometry", self.saveGeometry())
+
+    def toggle_fullscreen(self):
+        if self.isFullScreen():
+            self.showNormal()
+        else:
+            self.showFullScreen()
+
+    # ── system tray (Phase 5.5) ──
+    def _setup_tray(self):
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            self.tray = None
+            return
+        icon = QIcon(GraphicsDirectoryPath("Mic_on.png"))
+        self.tray = QSystemTrayIcon(icon, self)
+        self.tray.setToolTip(f"{Assistantname} — running")
+        menu = QMenu()
+        show_action = QAction("Show Jarvis", self)
+        show_action.triggered.connect(self._restore_from_tray)
+        quit_action = QAction("Quit", self)
+        quit_action.triggered.connect(self._quit_from_tray)
+        menu.addAction(show_action)
+        menu.addSeparator()
+        menu.addAction(quit_action)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self._on_tray_activated)
+        self.tray.show()
+
+    def _on_tray_activated(self, reason):
+        if reason in (QSystemTrayIcon.DoubleClick, QSystemTrayIcon.Trigger):
+            self._restore_from_tray()
+
+    def _restore_from_tray(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _quit_from_tray(self):
+        self._force_quit = True
+        self.close()
+
+    def closeEvent(self, event):
+        """The X button minimizes to the tray instead of quitting — a
+        wake-word assistant is meant to keep listening in the background
+        (ENHANCEMENT_PLAN.md 5.5), and the old behavior (forced fullscreen,
+        closing = quitting) didn't support that at all. The tray's own
+        "Quit" action and Ctrl+Q set _force_quit first to actually exit."""
+        if self.tray is not None and not self._force_quit:
+            event.ignore()
+            self.hide()
+            self.tray.showMessage(
+                f"{Assistantname} is still running",
+                "Minimized to the system tray. Right-click the tray icon to quit.",
+                QSystemTrayIcon.Information, 3000,
+            )
+            return
+        self._save_geometry()
+        event.accept()
+
+    # ── keyboard shortcuts (Phase 5.5) ──
+    def _setup_shortcuts(self):
+        # member= positional (not activated= keyword) — both work identically
+        # at runtime, but PyQt5-stubs' QShortcut overloads only model the
+        # positional/member= form; activated= is real PyQt5 API its stubs
+        # just don't cover, which mypy would otherwise flag on every line.
+        QShortcut(QKeySequence("Ctrl+Space"), self, self._toggle_mic)
+        QShortcut(QKeySequence("Ctrl+K"), self, self.open_command_palette)
+        QShortcut(QKeySequence("Esc"), self, self._stop_speaking)
+        QShortcut(QKeySequence("Ctrl+L"), self, self._clear_conversation)
+        QShortcut(QKeySequence("Ctrl+,"), self, self.open_settings)
+        QShortcut(QKeySequence("Ctrl+Q"), self, self._quit_from_tray)
+        QShortcut(QKeySequence("F11"), self, self.toggle_fullscreen)
+
+    def _toggle_mic(self):
+        """Ctrl+Space. Not true hold-to-talk (that would need a keyPress/
+        keyRelease pair rather than a QShortcut, plus a way to interrupt an
+        in-progress blocking mic read) — toggles the same mic-enabled state
+        the InitialScreen icon does, which is the toggle model the rest of
+        this app already uses."""
+        self.initial_screen.toggle_icon()
+
+    def _stop_speaking(self):
+        if self._worker is not None:
+            self._worker.stop_speaking()
+
+    def _clear_conversation(self):
+        confirm = QMessageBox.question(
+            self, "Clear conversation",
+            "Clear the current conversation? This can't be undone.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+        try:
+            from Backend.Database import clear_chat_history
+            clear_chat_history()
+        except Exception as e:
+            logger.warning("could not clear chat history: %s", e)
+        self.message_screen.chat_section.clear_messages()
+
+    def open_command_palette(self):
+        """Ctrl+K. Grounded in the agent's actual registered tools
+        (Backend.tools.registry) rather than a fixed list of made-up
+        example commands — picking one drops a template into the input box
+        for editing rather than invoking the tool directly, since most
+        tools take arguments only the user can supply."""
+        try:
+            from Backend.tools.registry import get_schemas
+            schemas = get_schemas()
+        except Exception as e:
+            logger.warning("could not load tool registry: %s", e)
+            schemas = []
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Command Palette")
+        dialog.setMinimumWidth(420)
+        layout = QVBoxLayout(dialog)
+        list_widget = QListWidget()
+        list_widget.setAccessibleName("Available commands")
+        for schema in schemas:
+            fn = schema["function"]
+            item = QListWidgetItem(f"{fn['name']} — {fn['description']}")
+            item.setData(Qt.UserRole, fn["name"])
+            list_widget.addItem(item)
+        layout.addWidget(list_widget)
+
+        def _pick(item):
+            self.stacked_widget.setCurrentIndex(1)
+            field = self.message_screen.chat_section.input_field
+            field.setText(f"Use {item.data(Qt.UserRole)} to ")
+            field.setFocus()
+            dialog.accept()
+
+        list_widget.itemDoubleClicked.connect(_pick)
+        dialog.exec_()
+
+    # ── settings / history / stats (Phase 5.5) ──
+    def open_settings(self):
+        SettingsDialog(self, on_theme_changed=self.apply_theme).exec_()
+
+    def open_stats(self):
+        StatsDialog(self).exec_()
+
+    def toggle_history_sidebar(self):
+        if self.history_sidebar.isVisible():
+            self.history_sidebar.hide()
+        else:
+            self.history_sidebar.refresh()
+            self.history_sidebar.show()
+
+    def _on_session_selected(self, session_id):
+        try:
+            from Backend.Database import get_chat_history, set_session_id
+            set_session_id(session_id)
+            history = get_chat_history(session_id=session_id, limit=200)
+        except Exception as e:
+            logger.warning("could not switch session: %s", e)
+            return
+        self.message_screen.chat_section.load_history(history)
+        self.stacked_widget.setCurrentIndex(1)
+        self.toasts.show_toast("Resumed a past conversation.", kind="info")
+
+    def apply_theme(self, name: str):
+        """The single place either of Frontend.theme's token dicts gets
+        touched (Phase 5.1, see ENHANCEMENT_PLAN.md). Sets the app-wide
+        stylesheet for widgets with no role-dependent colour, then asks
+        every widget that *does* have one (a user bubble's accent
+        background vs. an assistant bubble's surface background can't
+        both come from one global "QFrame { background: X }" rule) to
+        re-theme itself directly."""
+        theme.set_active(name)
+        tokens = theme.active()
+        # isinstance, not "is not None" — QApplication.instance() is typed
+        # via its base class QCoreApplication (a stub limitation, not a
+        # real ambiguity: main.py only ever constructs a QApplication), and
+        # setStyleSheet() is QApplication-specific, not on QCoreApplication.
+        app = QApplication.instance()
+        if isinstance(app, QApplication):
+            app.setStyleSheet(theme.stylesheet(tokens))
+        self.message_screen.chat_section.retheme(tokens)
+        self.initial_screen.retheme(tokens)
+        self._top_bar.retheme(tokens)
+        if hasattr(self, "history_sidebar"):
+            self.history_sidebar.retheme(tokens)
+        self.update()
+
+    def attach_worker(self, worker):
+        """Wire an AgentWorker's signals to this window's widgets, and this
+        window's user-initiated signals back to the worker's slots. This is
+        the only place file-based IPC used to happen — now it's all Qt
+        signal/slot connections.
+
+        worker -> GUI connections below are left as Qt.AutoConnection
+        (queued, since the worker lives on its own QThread): that's safe and
+        correct because the GUI thread's event loop (app.exec_() in
+        main.py) is always running to dispatch them.
+
+        GUI -> worker connections are forced to Qt.DirectConnection. The
+        worker's run() is a plain blocking Python loop, not
+        QThread.exec_(), so it never pumps a Qt event loop itself — a
+        queued connection into it would sit in that thread's event queue
+        forever and never be delivered. DirectConnection instead runs the
+        slot synchronously on the *calling* (GUI) thread, which is fine
+        here because every one of these slots only does a thread-safe
+        queue.Queue.put() or a plain attribute write (atomic under the
+        GIL for the bool/str values involved) — see agent_worker.py.
+        """
+        self._worker = worker
+        chat = self.message_screen.chat_section
+        initial = self.initial_screen
+
+        worker.state_changed.connect(initial.on_status)
+        worker.state_changed.connect(self._status_bar.showMessage)
+        worker.audio_level.connect(initial.visualizer.setLevel)
+        worker.user_message.connect(chat.on_user_message)
+        worker.token.connect(chat.on_token)
+        worker.response_done.connect(chat.on_response)
+        worker.tool_started.connect(chat.on_tool_started)
+        worker.tool_finished.connect(chat.on_tool_finished)
+        worker.error.connect(chat.on_error)
+        worker.error.connect(lambda msg: self.toasts.show_toast(msg, kind="error"))
+
+        # PyQt5-stubs' pyqtBoundSignal.connect() overloads don't model the
+        # (slot, Qt.ConnectionType) form at all — real PyQt5/sip supports
+        # it (that's the whole DirectConnection mechanism explained in this
+        # method's docstring above), the stub is just incomplete here.
+        chat.query_submitted.connect(worker.handle_text_query, Qt.DirectConnection)  # type: ignore[call-arg]
+        chat.file_uploaded.connect(worker.handle_file_uploaded, Qt.DirectConnection)  # type: ignore[call-arg]
+        initial.mic_toggled.connect(worker.set_mic_enabled, Qt.DirectConnection)  # type: ignore[call-arg]
+
+    def attach_scheduler(self, scheduler):
+        """Wire a Backend.scheduler_worker.SchedulerWorker's signals to the
+        chat panel (Phase 4.2/4.3). One-directional (scheduler -> GUI) —
+        the scheduler has no slots the GUI needs to call, unlike
+        attach_worker()'s AgentWorker, so there's no DirectConnection
+        half here."""
+        chat = self.message_screen.chat_section
+        scheduler.reminder_fired.connect(chat.on_reminder)
+        scheduler.briefing_fired.connect(chat.on_briefing)
+        scheduler.reminder_fired.connect(
+            lambda msg: self.toasts.show_toast(f"Reminder: {msg}", kind="reminder")
+        )
+        scheduler.briefing_fired.connect(
+            lambda _text: self.toasts.show_toast("Your morning briefing is ready.", kind="info")
+        )
 
 def GraphicalUserInterface():
+    """Standalone launcher used only for manual UI testing (no worker
+    attached — nothing will actually respond). main.py builds and wires
+    the real app (QApplication + MainWindow + AgentWorker on a QThread)."""
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()

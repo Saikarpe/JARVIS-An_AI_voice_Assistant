@@ -1,0 +1,38 @@
+name: CI
+
+# windows-latest, not ubuntu — this project targets Windows specifically
+# (ENHANCEMENT_PLAN.md rule 6) and several dependencies are Windows-only
+# or ship Windows-specific prebuilt wheels (webrtcvad-wheels, AppOpener,
+# keyboard, PyAudio).
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r Requirements.txt
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Type check (mypy)
+        run: mypy Backend Frontend main.py
+
+      - name: Test (pytest)
+        # No .env / API keys needed: every network client in Backend/ is
+        # constructed lazily on first use (Backend/groq_client.py), not at
+        # import time, and tests/conftest.py mocks the rest (Groq
+        # streaming responses, the embedding model) or points them at a
+        # throwaway SQLite file (JARVIS_DB_PATH) instead of a real one.
+        run: pytest -v
